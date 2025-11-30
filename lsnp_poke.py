@@ -236,13 +236,25 @@ class ReliableUDP:
 # Damage calculation
 # -------------------------
 
-def type_effectiveness(move_type: str, defender: PokemonStats) -> float:
+def type_effectiveness(move_type: str, defender: PokemonStats) -> Tuple[float, float]:
+    """
+    Return (Type1Effectiveness, Type2Effectiveness) for RFC formula.
+
+    The bundled pokemon.csv contains a combined multiplier per attacking type
+    (e.g., ``against_fire``). We treat that value as the primary type
+    multiplier and default the secondary type to 1.0 so we can still express
+    the RFC's "Type1Effectiveness * Type2Effectiveness" product without
+    double-counting a combined value.
+    """
+
     move_type = move_type.lower()
-    # pokemon.csv has columns like against_fire, against_water, etc.
-    # These represent the overall multiplier. We'll treat that as Type1*Type2.
-    if move_type in defender.against:
-        return defender.against[move_type]
-    return 1.0
+    combined = defender.against.get(move_type, 1.0)
+
+    # Use the combined multiplier for Type1 and neutral for Type2 if absent.
+    type1_eff = combined if defender.type1 else 1.0
+    type2_eff = 1.0 if not defender.type2 else combined if combined != 1.0 else 1.0
+
+    return type1_eff, type2_eff
 
 
 def calculate_damage(
@@ -256,6 +268,8 @@ def calculate_damage(
     use_sp_defense_boost: bool,
     sp_atk_uses_left: int,
     sp_def_uses_left: int,
+    attacker_current_hp: int,
+    defender_current_hp: int,
 ) -> Tuple[int, int, int, int, str, int, int]:
     """
     Very simple Pokémon-like damage formula with stat boosts.
@@ -286,20 +300,23 @@ def calculate_damage(
         def_stat = int(def_stat * 1.5)
         sp_def_uses_left -= 1
 
-    # Type effectiveness
-    eff = type_effectiveness(move_type, defender)
+    # Type effectiveness (RFC: basePower × attackerStat × Type1Eff × Type2Eff / defenderStat)
+    type1_eff, type2_eff = type_effectiveness(move_type, defender)
 
-    # Simple deterministic formula, level fixed at 50
-    level = 50
     damage = int(
-        (((2 * level / 5 + 2) * base_power * atk_stat / max(def_stat, 1)) / 50 + 2) * eff
+        base_power
+        * atk_stat
+        * type1_eff
+        * type2_eff
+        / max(def_stat, 1)
     )
     if damage < 1:
         damage = 1
 
-    defender_hp_after = max(defender.hp - damage, 0)
-    attacker_remaining_hp = attacker.hp  # we don't change self HP here
+    defender_hp_after = max(defender_current_hp - damage, 0)
+    attacker_remaining_hp = attacker_current_hp  # unchanged during outgoing attack
 
+    eff = type1_eff * type2_eff
     if eff > 1.0:
         eff_str = "It was super effective!"
     elif eff < 1.0:
@@ -341,8 +358,11 @@ class BattleState:
         self.opp_pokemon = opp_pokemon
         self.my_hp = my_pokemon.hp
         self.opp_hp = opp_pokemon.hp
-        self.sp_atk_uses = sp_atk_uses
-        self.sp_def_uses = sp_def_uses
+        # Track boost uses separately for each side to keep calculations in sync
+        self.my_sp_atk_uses = sp_atk_uses
+        self.my_sp_def_uses = sp_def_uses
+        self.opp_sp_atk_uses = sp_atk_uses
+        self.opp_sp_def_uses = sp_def_uses
         self.i_am_host = i_am_host
         self.my_turn = i_am_host  # host starts first
 
@@ -463,10 +483,16 @@ class LSNPNode:
 
             if mtype == "HANDSHAKE_REQUEST":
                 self._log(f"[HOST] HANDSHAKE_REQUEST from {addr}")
+                seq_num = int(fields.get("sequence_number", "0"))
+                if seq_num:
+                    self._send_ack(seq_num, addr)
                 self.peer_addr = addr
                 self.handle_handshake_as_host()
                 break
             elif mtype == "SPECTATOR_REQUEST":
+                seq_num = int(fields.get("sequence_number", "0"))
+                if seq_num:
+                    self._send_ack(seq_num, addr)
                 self._log(f"[HOST] Spectator joined from {addr} (spectator support limited in this skeleton)")
                 # In a full impl you would track spectator addrs and broadcast all battle + chat msgs to them.
             else:
@@ -480,6 +506,7 @@ class LSNPNode:
         # 1) Send HANDSHAKE_RESPONSE with seed
         seed = random.randint(1, 2**31 - 1)
         self.seed = seed
+        random.seed(seed)
         seq = self.reliable.next_seq()
         resp = {
             "message_type": "HANDSHAKE_RESPONSE",
@@ -654,7 +681,7 @@ class LSNPNode:
             }:
                 print(f"[SPECTATE] {mtype} :: {fields}")
             elif mtype == "CHAT_MESSAGE":
-                self._display_chat(fields)
+                self._handle_chat(fields, addr)
             # ACK handling is already done in recv_message / ReliableUDP
 
     # -----------------------------
@@ -725,6 +752,11 @@ class LSNPNode:
         attack_msg = {
             "message_type": "ATTACK_ANNOUNCE",
             "move_name": move_name,
+            "move_type": move_type,
+            "damage_category": cat,
+            "base_power": str(base_power),
+            "use_sp_attack_boost": str(use_sp_atk).lower(),
+            "use_sp_defense_boost": str(use_sp_def).lower(),
             "sequence_number": str(seq),
         }
         self.reliable.send(attack_msg, dest, reliable=True)
@@ -743,7 +775,7 @@ class LSNPNode:
                 self._send_ack(seq_num, addr)
                 defense_received = fields
             elif mtype == "CHAT_MESSAGE":
-                self._display_chat(fields)
+                self._handle_chat(fields, addr)
             else:
                 print(f"[TURN] Ignoring message while waiting DEFENSE: {fields}")
 
@@ -757,12 +789,14 @@ class LSNPNode:
             base_power=base_power,
             use_sp_attack_boost=use_sp_atk,
             use_sp_defense_boost=use_sp_def,
-            sp_atk_uses_left=bs.sp_atk_uses,
-            sp_def_uses_left=bs.sp_def_uses,
+            sp_atk_uses_left=bs.my_sp_atk_uses,
+            sp_def_uses_left=bs.my_sp_def_uses,
+            attacker_current_hp=bs.my_hp,
+            defender_current_hp=bs.opp_hp,
         )
 
-        bs.sp_atk_uses = sp_atk_left
-        bs.sp_def_uses = sp_def_left
+        bs.my_sp_atk_uses = sp_atk_left
+        bs.my_sp_def_uses = sp_def_left
         bs.opp_hp = opp_hp_after
 
         seq = self.reliable.next_seq()
@@ -792,7 +826,7 @@ class LSNPNode:
                 self._send_ack(seq_num, addr)
                 opp_report = fields
             elif mtype == "CHAT_MESSAGE":
-                self._display_chat(fields)
+                self._handle_chat(fields, addr)
             else:
                 print(f"[TURN] Ignoring message while waiting CALC_REPORT: {fields}")
 
@@ -818,11 +852,33 @@ class LSNPNode:
                 "message_type": "RESOLUTION_REQUEST",
                 "attacker": bs.my_pokemon.name,
                 "move_used": move_name,
+                "move_type": move_type,
+                "damage_category": cat,
+                "base_power": str(base_power),
+                "use_sp_attack_boost": str(use_sp_atk).lower(),
+                "use_sp_defense_boost": str(use_sp_def).lower(),
                 "damage_dealt": str(damage),
                 "defender_hp_remaining": str(opp_hp_after),
                 "sequence_number": str(seq),
             }
             self.reliable.send(resolution_req, dest, reliable=True)
+
+            # Wait for CALCULATION_CONFIRM before proceeding
+            print("[TURN] Waiting for CALCULATION_CONFIRM after RESOLUTION_REQUEST...")
+            while True:
+                msg = self.recv_message()
+                if msg is None:
+                    continue
+                fields, addr = msg
+                mtype = fields.get("message_type")
+                if mtype == "CALCULATION_CONFIRM":
+                    seq_num = int(fields.get("sequence_number", "0"))
+                    self._send_ack(seq_num, addr)
+                    break
+                elif mtype == "CHAT_MESSAGE":
+                    self._handle_chat(fields, addr)
+                else:
+                    print(f"[TURN] Ignoring message while awaiting CALCULATION_CONFIRM: {fields}")
 
         # Check for GAME_OVER condition
         if bs.opp_hp <= 0:
@@ -858,7 +914,7 @@ class LSNPNode:
                 self._send_ack(seq_num, addr)
                 attack_msg = fields
             elif mtype == "CHAT_MESSAGE":
-                self._display_chat(fields)
+                self._handle_chat(fields, addr)
             else:
                 print(f"[TURN] Ignoring message while waiting ATTACK_ANNOUNCE: {fields}")
 
@@ -872,15 +928,15 @@ class LSNPNode:
         }
         self.reliable.send(defense_msg, dest, reliable=True)
 
-        # 2) We compute damage as defender
-        # For fairness, ask user for move_type/category/power same as attacker.
-        move_type = input(f"Opponent used {move_name}. Enter move type to calculate damage [normal]: ").strip() or "normal"
-        cat = input("Damage category (physical/special) [special]: ").strip().lower() or "special"
-        base_power_str = input("Base power [60]: ").strip() or "60"
+        # 2) We compute damage as defender using the announced parameters (no prompts)
+        move_type = attack_msg.get("move_type", "normal")
+        cat = attack_msg.get("damage_category", "special").lower()
         try:
-            base_power = int(base_power_str)
+            base_power = int(attack_msg.get("base_power", "60"))
         except ValueError:
             base_power = 60
+        use_sp_atk = attack_msg.get("use_sp_attack_boost", "false").lower() == "true"
+        use_sp_def = attack_msg.get("use_sp_defense_boost", "false").lower() == "true"
 
         # We are the defender; attacker is opponent Pokémon
         damage, my_hp_after, opp_hp_same, sp_atk_left, sp_def_left, status_msg, defender_hp = calculate_damage(
@@ -890,12 +946,16 @@ class LSNPNode:
             move_type=move_type,
             damage_category=cat,
             base_power=base_power,
-            use_sp_attack_boost=False,
-            use_sp_defense_boost=False,
-            sp_atk_uses_left=bs.sp_atk_uses,
-            sp_def_uses_left=bs.sp_def_uses,
+            use_sp_attack_boost=use_sp_atk,
+            use_sp_defense_boost=use_sp_def,
+            sp_atk_uses_left=bs.opp_sp_atk_uses,
+            sp_def_uses_left=bs.opp_sp_def_uses,
+            attacker_current_hp=bs.opp_hp,
+            defender_current_hp=bs.my_hp,
         )
         bs.my_hp = my_hp_after
+        bs.opp_sp_atk_uses = sp_atk_left
+        bs.opp_sp_def_uses = sp_def_left
 
         # 3) Send our CALCULATION_REPORT
         seq = self.reliable.next_seq()
@@ -925,7 +985,7 @@ class LSNPNode:
                 self._send_ack(seq_num, addr)
                 opp_report = fields
             elif mtype == "CHAT_MESSAGE":
-                self._display_chat(fields)
+                self._handle_chat(fields, addr)
             else:
                 print(f"[TURN] Ignoring message while waiting CALC_REPORT: {fields}")
 
@@ -953,7 +1013,7 @@ class LSNPNode:
                     print("[TURN] Attacker sent RESOLUTION_REQUEST despite match; terminate for safety.")
                     return
                 elif mtype == "CHAT_MESSAGE":
-                    self._display_chat(fields)
+                    self._handle_chat(fields, addr)
         else:
             print("[TURN] Discrepancy detected; waiting for RESOLUTION_REQUEST...")
             while True:
@@ -965,11 +1025,24 @@ class LSNPNode:
                 if mtype == "RESOLUTION_REQUEST":
                     seq_num = int(fields.get("sequence_number", "0"))
                     self._send_ack(seq_num, addr)
-                    print("[TURN] RESOLUTION_REQUEST received; adopting their values and sending ACK.")
-                    # In full impl we would reconcile; here we trust attacker and continue.
+                    print("[TURN] RESOLUTION_REQUEST received; reconciling and confirming.")
+
+                    # Adopt attacker-provided authoritative results
+                    bs.my_hp = int(fields.get("defender_hp_remaining", bs.my_hp))
+                    bs.opp_hp = int(fields.get("remaining_health", bs.opp_hp))
+
+                    # Send CALCULATION_CONFIRM to finalize resolution
+                    confirm_seq = self.reliable.next_seq()
+                    confirm = {
+                        "message_type": "CALCULATION_CONFIRM",
+                        "sequence_number": str(confirm_seq),
+                        "acknowledged_damage": fields.get("damage_dealt", ""),
+                        "acknowledged_defender_hp": fields.get("defender_hp_remaining", ""),
+                    }
+                    self.reliable.send(confirm, dest, reliable=True)
                     break
                 elif mtype == "CHAT_MESSAGE":
-                    self._display_chat(fields)
+                    self._handle_chat(fields, addr)
 
         # Check for GAME_OVER
         if bs.my_hp <= 0:
@@ -985,7 +1058,7 @@ class LSNPNode:
                     print(f"[BATTLE] GAME_OVER received. Winner={fields.get('winner')}")
                     return
                 elif fields.get("message_type") == "CHAT_MESSAGE":
-                    self._display_chat(fields)
+                    self._handle_chat(fields, addr)
         else:
             bs.my_turn = True  # Reverse turn
 
@@ -1029,6 +1102,13 @@ class LSNPNode:
             "sequence_number": str(seq),
         }
         self.reliable.send(msg, self.peer_addr, reliable=True)
+
+    def _handle_chat(self, fields: Dict[str, str], addr: Tuple[str, int]):
+        """Ack the reliable chat message then display it."""
+        seq_num = int(fields.get("sequence_number", "0"))
+        if seq_num:
+            self._send_ack(seq_num, addr)
+        self._display_chat(fields)
 
     def _display_chat(self, fields: Dict[str, str]):
         sender = fields.get("sender_name", "Unknown")
