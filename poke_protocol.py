@@ -285,8 +285,17 @@ def type_effectiveness(move_type: str, defender: PokemonStats) -> Tuple[float, f
     combined = defender.against.get(move_type, 1.0)
 
     # Use the combined multiplier for Type1 and neutral for Type2 if absent.
-    type1_eff = combined if defender.type1 else 1.0
-    type2_eff = 1.0 if not defender.type2 else combined if combined != 1.0 else 1.0
+    if defender.type1:
+        type1_eff = combined
+    else:
+        type1_eff = 1.0
+    
+    # Type2 effectiveness: use combined only if defender has a second type 
+    # and the combined multiplier is not neutral
+    if defender.type2 and combined != 1.0:
+        type2_eff = combined
+    else:
+        type2_eff = 1.0
 
     return type1_eff, type2_eff
 
@@ -304,7 +313,7 @@ def calculate_damage(
     sp_def_uses_left: int,
     attacker_current_hp: int,
     defender_current_hp: int,
-) -> Tuple[int, int, int, int, str, int, int]:
+) -> Tuple[int, int, int, int, int, str]:
     """
     Very simple Pokémon-like damage formula with stat boosts.
 
@@ -367,7 +376,6 @@ def calculate_damage(
         sp_atk_uses_left,
         sp_def_uses_left,
         status_message,
-        defender_hp_after,
     )
 
 
@@ -982,7 +990,7 @@ class LSNPNode:
 
         # 3) Both players compute damage + send CALCULATION_REPORT
         # Note: use_sp_def from attacker's announce is ignored - defender chooses their own boost
-        damage, opp_hp_after, my_hp_same, sp_atk_left, sp_def_left, status_msg, defender_hp = calculate_damage(
+        damage, opp_hp_after, my_hp_same, sp_atk_left, sp_def_left, status_msg = calculate_damage(
             attacker=bs.my_pokemon,
             defender=bs.opp_pokemon,
             move_name=move_name,
@@ -1155,7 +1163,7 @@ class LSNPNode:
         use_sp_atk = attack_msg.get("use_sp_attack_boost", "false").lower() == "true"
 
         # We are the defender; attacker is opponent Pokémon
-        damage, my_hp_after, opp_hp_same, sp_atk_left, sp_def_left, status_msg, defender_hp = calculate_damage(
+        damage, my_hp_after, opp_hp_same, sp_atk_left, sp_def_left, status_msg = calculate_damage(
             attacker=bs.opp_pokemon,
             defender=bs.my_pokemon,
             move_name=move_name,
