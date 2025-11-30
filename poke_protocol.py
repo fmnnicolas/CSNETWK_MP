@@ -16,10 +16,19 @@ import time
 import base64
 import json
 import os
+import queue
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Callable
 import random
 import csv
+import io
+
+# Optional PIL for sticker validation
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # -------------------------
 # Config
@@ -28,6 +37,11 @@ import csv
 ACK_TIMEOUT_SEC = 0.5          # RFC recommended ~500ms
 MAX_RETRIES = 3                # Recommended in RFC
 BUFFER_SIZE = 65535
+
+# Sticker constraints per RFC spec
+MAX_STICKER_WIDTH = 320        # pixels
+MAX_STICKER_HEIGHT = 320       # pixels
+MAX_STICKER_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 DEFAULT_COMM_MODE = "P2P"      # we always run P2P; BROADCAST is left as extension
 
@@ -138,15 +152,19 @@ class ReliableUDP:
     - sequence numbers
     - explicit ACK messages
     - retransmission on timeout
+    - connection lost callback when max retries exceeded (per RFC spec)
     """
 
-    def __init__(self, sock: socket.socket, verbose: bool = False):
+    def __init__(self, sock: socket.socket, verbose: bool = False, 
+                 on_connection_lost: Optional[Callable[[], None]] = None):
         self.sock = sock
         self.verbose = verbose
         self._seq = 1
         self._lock = threading.Lock()
         self._pending: Dict[int, PendingMessage] = {}
         self.running = True
+        self.on_connection_lost = on_connection_lost  # Callback for connection termination
+        self.connection_lost_event = threading.Event()
 
         self.retransmit_thread = threading.Thread(
             target=self._retransmit_loop, daemon=True
@@ -161,6 +179,10 @@ class ReliableUDP:
 
     def stop(self):
         self.running = False
+
+    def set_connection_lost_callback(self, callback: Callable[[], None]):
+        """Set the callback to be invoked when connection is lost (max retries exceeded)."""
+        self.on_connection_lost = callback
 
     def _retransmit_loop(self):
         while self.running:
@@ -190,8 +212,14 @@ class ReliableUDP:
             for seq in to_fail:
                 with self._lock:
                     pm = self._pending.pop(seq, None)
-                    if pm and self.verbose:
-                        print(f"[RELIABLE] Giving up on seq={seq} after {MAX_RETRIES} retries")
+                    if pm:
+                        if self.verbose:
+                            print(f"[RELIABLE] Giving up on seq={seq} after {MAX_RETRIES} retries")
+                        # Per RFC spec: terminate battle when max retries exceeded
+                        print(f"[ERROR] Connection lost - max retries exceeded for seq={seq}")
+                        self.connection_lost_event.set()
+                        if self.on_connection_lost:
+                            self.on_connection_lost()
 
             time.sleep(0.05)
 
@@ -205,7 +233,11 @@ class ReliableUDP:
             raise ValueError("sequence_number is required for reliable messages")
 
         if self.verbose:
-            print(f"[SEND] -> {dest} :: {fields}")
+            print("=" * 60)
+            print(f"[SEND] -> {dest}")
+            for k, v in fields.items():
+                print(f"  {k}: {v}")
+            print("=" * 60)
 
         self.sock.sendto(encode_message(fields), dest)
 
@@ -228,7 +260,9 @@ class ReliableUDP:
         with self._lock:
             if ack_no in self._pending:
                 if self.verbose:
+                    print("=" * 60)
                     print(f"[RELIABLE] ACK received for seq={ack_no}")
+                    print("=" * 60)
                 self._pending.pop(ack_no, None)
 
 
@@ -251,8 +285,17 @@ def type_effectiveness(move_type: str, defender: PokemonStats) -> Tuple[float, f
     combined = defender.against.get(move_type, 1.0)
 
     # Use the combined multiplier for Type1 and neutral for Type2 if absent.
-    type1_eff = combined if defender.type1 else 1.0
-    type2_eff = 1.0 if not defender.type2 else combined if combined != 1.0 else 1.0
+    if defender.type1:
+        type1_eff = combined
+    else:
+        type1_eff = 1.0
+    
+    # Type2 effectiveness: use combined only if defender has a second type 
+    # and the combined multiplier is not neutral
+    if defender.type2 and combined != 1.0:
+        type2_eff = combined
+    else:
+        type2_eff = 1.0
 
     return type1_eff, type2_eff
 
@@ -270,7 +313,7 @@ def calculate_damage(
     sp_def_uses_left: int,
     attacker_current_hp: int,
     defender_current_hp: int,
-) -> Tuple[int, int, int, int, str, int, int]:
+) -> Tuple[int, int, int, int, int, str]:
     """
     Very simple Pokémon-like damage formula with stat boosts.
 
@@ -333,7 +376,6 @@ def calculate_damage(
         sp_atk_uses_left,
         sp_def_uses_left,
         status_message,
-        defender_hp_after,
     )
 
 
@@ -374,8 +416,9 @@ class LSNPNode:
     - Handshake
     - Battle setup
     - Turn-based flow
-    - Reliability
-    - Chat (text + sticker)
+    - Reliability with connection termination
+    - Asynchronous chat (text + sticker) - non-blocking battle state machine
+    - Spectator broadcasting
     """
 
     def __init__(
@@ -393,16 +436,26 @@ class LSNPNode:
         self.peer_ip = peer_ip
         self.peer_port = peer_port
         self.verbose = verbose
+        self.running = True
 
         # Socket & reliability wrapper
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", local_port))
         self.sock.settimeout(1.0)
 
-        self.reliable = ReliableUDP(self.sock, verbose=verbose)
+        self.reliable = ReliableUDP(self.sock, verbose=verbose, 
+                                     on_connection_lost=self._on_connection_lost)
 
         # Peers
         self.peer_addr: Optional[Tuple[str, int]] = None
+
+        # Spectator tracking (host only)
+        self.spectators: List[Tuple[str, int]] = []
+
+        # Asynchronous chat support - queues for message handling
+        self.incoming_queue: queue.Queue = queue.Queue()  # For battle messages
+        self.chat_queue: queue.Queue = queue.Queue()       # For chat messages
+        self.connection_lost = threading.Event()
 
         # Pokémon
         self.pdb = PokemonDatabase(pokemon_csv_path)
@@ -416,6 +469,9 @@ class LSNPNode:
         # Random seed (from host)
         self.seed: Optional[int] = None
 
+        # Receiver thread for async chat
+        self.receiver_thread: Optional[threading.Thread] = None
+
         # Verbose flag
         print(f"[INFO] LSNPNode role={self.role}, local_port={local_port}, verbose={verbose}")
 
@@ -426,14 +482,34 @@ class LSNPNode:
     def _log(self, msg: str):
         print(msg)
 
+    def _on_connection_lost(self):
+        """Called when max retries exceeded - terminates the battle per RFC spec."""
+        print("[ERROR] Connection lost - battle terminated due to max retries exceeded")
+        self.connection_lost.set()
+        self.running = False
+
     def _send_ack(self, ack_number: int, dest: Tuple[str, int]):
         fields = {
             "message_type": "ACK",
             "ack_number": str(ack_number),
         }
         if self.verbose:
-            print(f"[SEND] ACK -> {dest} :: {fields}")
+            print("=" * 60)
+            print(f"[SEND] ACK -> {dest}")
+            print(f"  ack_number: {ack_number}")
+            print("=" * 60)
         self.sock.sendto(encode_message(fields), dest)
+
+    def broadcast_to_spectators(self, fields: Dict[str, str]):
+        """Send battle message to all connected spectators (non-reliable)."""
+        for spec_addr in self.spectators:
+            try:
+                self.sock.sendto(encode_message(fields), spec_addr)
+                if self.verbose:
+                    print(f"[BROADCAST] -> Spectator {spec_addr}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"[BROADCAST] Failed to send to {spec_addr}: {e}")
 
     # -----------------------------
     # Role entrypoints
@@ -460,12 +536,77 @@ class LSNPNode:
             return None
         fields = decode_message(data)
         if self.verbose:
-            print(f"[RECV] <- {addr} :: {fields}")
+            print("=" * 60)
+            print(f"[RECV] <- {addr}")
+            for k, v in fields.items():
+                # Truncate sticker data for readability
+                if k == "sticker_data" and len(v) > 50:
+                    print(f"  {k}: {v[:50]}... (truncated)")
+                else:
+                    print(f"  {k}: {v}")
+            print("=" * 60)
         # ACK handling
         if fields.get("message_type") == "ACK":
             self.reliable.handle_incoming_ack(fields)
             return None
         return fields, addr
+
+    def _start_async_receiver(self):
+        """Start the asynchronous receiver thread for non-blocking chat during battle."""
+        if self.receiver_thread is None or not self.receiver_thread.is_alive():
+            self.receiver_thread = threading.Thread(target=self._async_receiver_loop, daemon=True)
+            self.receiver_thread.start()
+
+    def _async_receiver_loop(self):
+        """
+        Separate thread that receives all UDP messages and dispatches them.
+        Chat messages go to chat_queue (non-blocking), battle messages to incoming_queue.
+        Per RFC spec: chat works asynchronously, not blocking battle state machine.
+        """
+        while self.running and not self.connection_lost.is_set():
+            try:
+                data, addr = self.sock.recvfrom(BUFFER_SIZE)
+                fields = decode_message(data)
+                
+                if self.verbose:
+                    print("=" * 60)
+                    print(f"[ASYNC RECV] <- {addr}")
+                    for k, v in fields.items():
+                        if k == "sticker_data" and len(v) > 50:
+                            print(f"  {k}: {v[:50]}... (truncated)")
+                        else:
+                            print(f"  {k}: {v}")
+                    print("=" * 60)
+                
+                mtype = fields.get("message_type")
+                
+                if mtype == "ACK":
+                    self.reliable.handle_incoming_ack(fields)
+                elif mtype == "CHAT_MESSAGE":
+                    # Handle ACK for chat and queue it for async display
+                    seq_num = int(fields.get("sequence_number", "0"))
+                    if seq_num:
+                        self._send_ack(seq_num, addr)
+                    self.chat_queue.put((fields, addr))
+                    # Display chat immediately in async mode
+                    self._display_chat(fields)
+                else:
+                    # Battle messages go to incoming queue
+                    self.incoming_queue.put((fields, addr))
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"[ASYNC RECV] Error: {e}")
+
+    def _process_pending_chats(self):
+        """Process any pending chat messages from the async queue."""
+        while not self.chat_queue.empty():
+            try:
+                fields, addr = self.chat_queue.get_nowait()
+                self._display_chat(fields)
+            except queue.Empty:
+                break
 
     # -----------------------------
     # Host flow
@@ -493,8 +634,10 @@ class LSNPNode:
                 seq_num = int(fields.get("sequence_number", "0"))
                 if seq_num:
                     self._send_ack(seq_num, addr)
-                self._log(f"[HOST] Spectator joined from {addr} (spectator support limited in this skeleton)")
-                # In a full impl you would track spectator addrs and broadcast all battle + chat msgs to them.
+                # Track spectator address for broadcasting battle messages
+                if addr not in self.spectators:
+                    self.spectators.append(addr)
+                self._log(f"[HOST] Spectator joined from {addr} (total spectators: {len(self.spectators)})")
             else:
                 self._log(f"[HOST] Ignoring unexpected message: {fields}")
 
@@ -645,10 +788,16 @@ class LSNPNode:
         self.run_battle_loop(is_host=False)
 
     # -----------------------------
-    # Spectator flow (minimal)
+    # Spectator flow
     # -----------------------------
 
     def run_spectator(self):
+        """
+        Spectator mode per RFC spec:
+        - Receives all battle messages (ATTACK_ANNOUNCE, DEFENSE_ANNOUNCE, CALCULATION_REPORT, GAME_OVER)
+        - Can only send CHAT_MESSAGE, not battle commands
+        - Displays battle state updates in real-time
+        """
         if not self.peer_ip or not self.peer_port:
             raise ValueError("Spectator requires peer_ip and peer_port")
         dest = (self.peer_ip, self.peer_port)
@@ -660,29 +809,80 @@ class LSNPNode:
             "sequence_number": str(seq),
         }
         self.reliable.send(req, dest, reliable=True)
-        self._log("[SPECTATOR] SPECTATOR_REQUEST sent. Now passively printing battle/chat messages...")
+        self._log("[SPECTATOR] SPECTATOR_REQUEST sent. Watching battle...")
+        self._log("[SPECTATOR] Type 'c' to send chat, 's' to send sticker (during input prompts)")
 
-        while True:
+        # Track battle state for spectator display
+        host_hp = "?"
+        joiner_hp = "?"
+        host_pokemon = "Unknown"
+        joiner_pokemon = "Unknown"
+
+        while self.running:
             msg = self.recv_message()
             if msg is None:
                 continue
             fields, addr = msg
             mtype = fields.get("message_type")
+            
+            # Display all battle messages with clear formatting
             if mtype in {
-                "HANDSHAKE_REQUEST",
-                "HANDSHAKE_RESPONSE",
-                "BATTLE_SETUP",
                 "ATTACK_ANNOUNCE",
-                "DEFENSE_ANNOUNCE",
+                "DEFENSE_ANNOUNCE", 
                 "CALCULATION_REPORT",
-                "CALCULATION_CONFIRM",
-                "RESOLUTION_REQUEST",
                 "GAME_OVER",
             }:
-                print(f"[SPECTATE] {mtype} :: {fields}")
+                print("\n" + "=" * 60)
+                print(f"[SPECTATE] {mtype}")
+                for k, v in fields.items():
+                    if k != "sequence_number":
+                        print(f"  {k}: {v}")
+                print("=" * 60)
+                
+                # Update tracked state
+                if mtype == "CALCULATION_REPORT":
+                    attacker = fields.get("attacker", "")
+                    defender_hp = fields.get("defender_hp_remaining", "?")
+                    damage = fields.get("damage_dealt", "?")
+                    status = fields.get("status_message", "")
+                    print(f"\n[SPECTATE] {attacker} dealt {damage} damage! Defender HP: {defender_hp}")
+                    if status:
+                        print(f"[SPECTATE] {status}")
+                        
+                elif mtype == "GAME_OVER":
+                    winner = fields.get("winner", "Unknown")
+                    loser = fields.get("loser", "Unknown")
+                    print(f"\n[SPECTATE] *** GAME OVER ***")
+                    print(f"[SPECTATE] Winner: {winner}")
+                    print(f"[SPECTATE] Loser: {loser}")
+                    break
+                    
+            elif mtype == "BATTLE_SETUP":
+                pokemon = fields.get("pokemon_name", "Unknown")
+                print(f"[SPECTATE] Battle setup: {pokemon} joined the battle")
+                
             elif mtype == "CHAT_MESSAGE":
                 self._handle_chat(fields, addr)
+                
             # ACK handling is already done in recv_message / ReliableUDP
+
+    def _spectator_send_chat(self):
+        """Allow spectator to send chat messages only."""
+        if not self.peer_addr:
+            print("[SPECTATOR] No host connected.")
+            return
+        text = input("[SPECTATOR] Chat message: ").strip()
+        if not text:
+            return
+        seq = self.reliable.next_seq()
+        msg = {
+            "message_type": "CHAT_MESSAGE",
+            "sender_name": "Spectator",
+            "content_type": "TEXT",
+            "message_text": text,
+            "sequence_number": str(seq),
+        }
+        self.reliable.send(msg, self.peer_addr, reliable=True)
 
     # -----------------------------
     # Battle loop core
@@ -694,6 +894,11 @@ class LSNPNode:
         self._log("[BATTLE] Starting battle loop. Host moves first.")
 
         while True:
+            # Check for connection lost (per RFC spec - terminate battle on max retries)
+            if self.connection_lost.is_set():
+                self._log("[BATTLE] Connection lost - battle terminated.")
+                break
+                
             print(f"\n[BATTLE] Your HP={bs.my_hp}, Opp HP={bs.opp_hp}")
             if bs.my_hp <= 0 or bs.opp_hp <= 0:
                 break
@@ -756,10 +961,11 @@ class LSNPNode:
             "damage_category": cat,
             "base_power": str(base_power),
             "use_sp_attack_boost": str(use_sp_atk).lower(),
-            "use_sp_defense_boost": str(use_sp_def).lower(),
             "sequence_number": str(seq),
         }
         self.reliable.send(attack_msg, dest, reliable=True)
+        # Broadcast to spectators
+        self.broadcast_to_spectators(attack_msg)
 
         # 2) Wait for DEFENSE_ANNOUNCE
         print("[TURN] Waiting for DEFENSE_ANNOUNCE...")
@@ -779,8 +985,12 @@ class LSNPNode:
             else:
                 print(f"[TURN] Ignoring message while waiting DEFENSE: {fields}")
 
+        # Get defender's sp_defense_boost choice from DEFENSE_ANNOUNCE
+        defender_use_sp_def = defense_received.get("use_sp_defense_boost", "false").lower() == "true"
+
         # 3) Both players compute damage + send CALCULATION_REPORT
-        damage, opp_hp_after, my_hp_same, sp_atk_left, sp_def_left, status_msg, defender_hp = calculate_damage(
+        # Note: use_sp_def from attacker's announce is ignored - defender chooses their own boost
+        damage, opp_hp_after, my_hp_same, sp_atk_left, sp_def_left, status_msg = calculate_damage(
             attacker=bs.my_pokemon,
             defender=bs.opp_pokemon,
             move_name=move_name,
@@ -788,15 +998,17 @@ class LSNPNode:
             damage_category=cat,
             base_power=base_power,
             use_sp_attack_boost=use_sp_atk,
-            use_sp_defense_boost=use_sp_def,
+            use_sp_defense_boost=defender_use_sp_def,
             sp_atk_uses_left=bs.my_sp_atk_uses,
-            sp_def_uses_left=bs.my_sp_def_uses,
+            sp_def_uses_left=bs.opp_sp_def_uses,  # Use opponent's defense uses tracking
             attacker_current_hp=bs.my_hp,
             defender_current_hp=bs.opp_hp,
         )
 
         bs.my_sp_atk_uses = sp_atk_left
-        bs.my_sp_def_uses = sp_def_left
+        # Update opponent's defense uses when defender uses their boost
+        if defender_use_sp_def:
+            bs.opp_sp_def_uses = sp_def_left
         bs.opp_hp = opp_hp_after
 
         seq = self.reliable.next_seq()
@@ -811,6 +1023,8 @@ class LSNPNode:
             "sequence_number": str(seq),
         }
         self.reliable.send(calc_report, dest, reliable=True)
+        # Broadcast to spectators
+        self.broadcast_to_spectators(calc_report)
 
         # 4) Receive opponent's CALCULATION_REPORT and confirm or request resolution
         print("[TURN] Waiting for opponent CALCULATION_REPORT...")
@@ -891,6 +1105,8 @@ class LSNPNode:
                 "sequence_number": str(seq),
             }
             self.reliable.send(game_over, dest, reliable=True)
+            # Broadcast to spectators
+            self.broadcast_to_spectators(game_over)
             return
 
         # Reverse turn
@@ -919,27 +1135,35 @@ class LSNPNode:
                 print(f"[TURN] Ignoring message while waiting ATTACK_ANNOUNCE: {fields}")
 
         move_name = attack_msg.get("move_name", "Unknown")
+        move_type = attack_msg.get("move_type", "normal")
+        cat = attack_msg.get("damage_category", "special").lower()
 
-        # 1) Send DEFENSE_ANNOUNCE
+        # Defender gets to choose whether to use special defense boost
+        use_sp_def = False
+        if cat == "special" and bs.my_sp_def_uses > 0:
+            choice = input(f"Incoming special attack! Use special defense boost? ({bs.my_sp_def_uses} uses left) (y/N): ").strip().lower()
+            use_sp_def = (choice == "y")
+
+        # 1) Send DEFENSE_ANNOUNCE with defender's sp_defense boost choice
         seq = self.reliable.next_seq()
         defense_msg = {
             "message_type": "DEFENSE_ANNOUNCE",
+            "use_sp_defense_boost": str(use_sp_def).lower(),
             "sequence_number": str(seq),
         }
         self.reliable.send(defense_msg, dest, reliable=True)
+        # Broadcast to spectators
+        self.broadcast_to_spectators(defense_msg)
 
-        # 2) We compute damage as defender using the announced parameters (no prompts)
-        move_type = attack_msg.get("move_type", "normal")
-        cat = attack_msg.get("damage_category", "special").lower()
+        # 2) We compute damage as defender using the announced parameters
         try:
             base_power = int(attack_msg.get("base_power", "60"))
         except ValueError:
             base_power = 60
         use_sp_atk = attack_msg.get("use_sp_attack_boost", "false").lower() == "true"
-        use_sp_def = attack_msg.get("use_sp_defense_boost", "false").lower() == "true"
 
         # We are the defender; attacker is opponent Pokémon
-        damage, my_hp_after, opp_hp_same, sp_atk_left, sp_def_left, status_msg, defender_hp = calculate_damage(
+        damage, my_hp_after, opp_hp_same, sp_atk_left, sp_def_left, status_msg = calculate_damage(
             attacker=bs.opp_pokemon,
             defender=bs.my_pokemon,
             move_name=move_name,
@@ -949,13 +1173,17 @@ class LSNPNode:
             use_sp_attack_boost=use_sp_atk,
             use_sp_defense_boost=use_sp_def,
             sp_atk_uses_left=bs.opp_sp_atk_uses,
-            sp_def_uses_left=bs.opp_sp_def_uses,
+            sp_def_uses_left=bs.my_sp_def_uses,  # Use my own defense uses
             attacker_current_hp=bs.opp_hp,
             defender_current_hp=bs.my_hp,
         )
         bs.my_hp = my_hp_after
-        bs.opp_sp_atk_uses = sp_atk_left
-        bs.opp_sp_def_uses = sp_def_left
+        # Update attacker's sp_atk uses when they use their boost
+        if use_sp_atk:
+            bs.opp_sp_atk_uses = sp_atk_left
+        # Update my sp_def uses when I use my boost
+        if use_sp_def:
+            bs.my_sp_def_uses = sp_def_left
 
         # 3) Send our CALCULATION_REPORT
         seq = self.reliable.next_seq()
@@ -970,6 +1198,8 @@ class LSNPNode:
             "sequence_number": str(seq),
         }
         self.reliable.send(calc_report, dest, reliable=True)
+        # Broadcast to spectators
+        self.broadcast_to_spectators(calc_report)
 
         # 4) Receive opponent CALCULATION_REPORT and decide confirm or resolution
         print("[TURN] Waiting for opponent CALCULATION_REPORT...")
@@ -1091,6 +1321,27 @@ class LSNPNode:
         if not os.path.exists(path):
             print("[CHAT] File not found.")
             return
+        
+        # Validate sticker constraints per RFC spec
+        file_size = os.path.getsize(path)
+        if file_size > MAX_STICKER_SIZE_BYTES:
+            print(f"[CHAT] Sticker file too large: {file_size} bytes (max {MAX_STICKER_SIZE_BYTES} bytes / 10 MB)")
+            return
+        
+        # Validate image dimensions (if PIL is available)
+        if PIL_AVAILABLE:
+            try:
+                with Image.open(path) as img:
+                    width, height = img.size
+                    if width > MAX_STICKER_WIDTH or height > MAX_STICKER_HEIGHT:
+                        print(f"[CHAT] Sticker dimensions too large: {width}x{height} (max {MAX_STICKER_WIDTH}x{MAX_STICKER_HEIGHT})")
+                        return
+            except Exception as e:
+                print(f"[CHAT] Could not validate image dimensions: {e}")
+                # Proceed anyway if PIL fails but file exists
+        else:
+            print("[CHAT] PIL not available - skipping dimension validation")
+        
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("ascii")
         seq = self.reliable.next_seq()
@@ -1116,7 +1367,28 @@ class LSNPNode:
         if ctype == "TEXT":
             print(f"[CHAT] {sender}: {fields.get('message_text','')}")
         elif ctype == "STICKER":
-            print(f"[CHAT] {sender} sent a STICKER (Base64 length={len(fields.get('sticker_data',''))})")
+            sticker_data = fields.get('sticker_data', '')
+            data_len = len(sticker_data)
+            
+            # Validate received sticker per RFC spec
+            try:
+                decoded = base64.b64decode(sticker_data)
+                if len(decoded) > MAX_STICKER_SIZE_BYTES:
+                    print(f"[CHAT] Rejected sticker from {sender}: exceeds 10 MB limit")
+                    return
+                
+                # Validate image dimensions (if PIL is available)
+                if PIL_AVAILABLE:
+                    img = Image.open(io.BytesIO(decoded))
+                    width, height = img.size
+                    if width > MAX_STICKER_WIDTH or height > MAX_STICKER_HEIGHT:
+                        print(f"[CHAT] Rejected sticker from {sender}: dimensions {width}x{height} exceed {MAX_STICKER_WIDTH}x{MAX_STICKER_HEIGHT}")
+                        return
+                    print(f"[CHAT] {sender} sent a STICKER ({width}x{height}, Base64 length={data_len})")
+                else:
+                    print(f"[CHAT] {sender} sent a STICKER (Base64 length={data_len})")
+            except Exception as e:
+                print(f"[CHAT] {sender} sent a STICKER (Base64 length={data_len}, validation skipped: {e})")
         else:
             print(f"[CHAT] Unknown chat content: {fields}")
 
