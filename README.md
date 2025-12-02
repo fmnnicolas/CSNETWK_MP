@@ -5,7 +5,7 @@ This version supports **Host / Joiner gameplay**, a basic **Spectator handshake*
 
 ---
 
-## 📦 What This Implementation Actually Does (no sugar-coating)
+## 📦 What This Implementation Actually Does
 
 ✔️ **Peer-to-peer over UDP**
 ✔️ **Roles: HOST, JOINER, SPECTATOR (handshake only)**
