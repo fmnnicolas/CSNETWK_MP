@@ -214,9 +214,9 @@ python poke_ultimate.py --role JOINER --peer-ip <HOST-IP> --peer-port 9000
 
 # 🤖 AI Usage
 
-* It helped generate snippets / structure
-* All code was tested & reviewed by the group
-* The group completely understand & can explain every subsystem
+* It helped by suggesting key fixes to the code.
+* All code was tested & reviewed by the group.
+* The group completely understand & can explain every part.
 
 ---
 
