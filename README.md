@@ -30,7 +30,7 @@ This version supports **Host / Joiner gameplay**, a basic **Spectator handshake*
 
 # 🗂️ Files
 
-* `poke_ultimate.py` — main program
+* `poke_protocol.py` — main program
 * `pokemon.csv` — source of stats & type effectiveness
 * `stickers/` — automatically saved incoming stickers
 
@@ -41,7 +41,7 @@ This version supports **Host / Joiner gameplay**, a basic **Spectator handshake*
 ## Host
 
 ```bash
-python poke_ultimate.py --role HOST --local-port 9000 --pokemon Pikachu --verbose
+python poke_.py --role HOST --local-port 9000 --pokemon Pikachu --verbose
 ```
 
 Host waits for a Joiner to handshake.
@@ -49,7 +49,7 @@ Host waits for a Joiner to handshake.
 ## Joiner
 
 ```bash
-python poke_ultimate.py --role JOINER \
+python poke_protocol.py --role JOINER \
     --peer-ip 127.0.0.1 --peer-port 9000 \
     --pokemon Charmander --verbose
 ```
@@ -59,7 +59,7 @@ python poke_ultimate.py --role JOINER \
 ## Spectator
 
 ```bash
-python poke_ultimate.py --role SPECTATOR \
+python poke_protocol.py --role SPECTATOR \
     --peer-ip 127.0.0.1 --peer-port 9000
 ```
 
@@ -201,13 +201,13 @@ Two consoles or two machines:
 **Host**
 
 ```
-python poke_ultimate.py --role HOST --local-port 9000
+python poke_protocol.py --role HOST --local-port 9000
 ```
 
 **Joiner**
 
 ```
-python poke_ultimate.py --role JOINER --peer-ip <HOST-IP> --peer-port 9000
+python poke_protocol.py --role JOINER --peer-ip <HOST-IP> --peer-port 9000
 ```
 
 ---
