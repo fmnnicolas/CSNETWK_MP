@@ -2,6 +2,7 @@
 from __future__ import annotations
 import random
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -26,6 +27,7 @@ class ReliableUDP:
     """
     def __init__(self, bind_ip: str, bind_port: int, cfg: ReliableConfig):
         self.cfg = cfg
+        self.connection_lost_event = threading.Event()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((bind_ip, bind_port))
         self.sock.settimeout(0.1)
@@ -81,6 +83,8 @@ class ReliableUDP:
         self.send(addr, ack)
 
     def poll(self) -> Optional[Tuple[Addr, WireMessage]]:
+        if self.connection_lost_event.is_set():
+            return None
         # Retransmit pending
         now = time.time()
         for key, (deadline, retries_left, payload) in list(self._pending.items()):
@@ -90,8 +94,8 @@ class ReliableUDP:
             if retries_left <= 0:
                 self._log(f"GIVEUP {addr} seq={seq} -> assume lost connection")
                 del self._pending[key]
-                # Caller decides whether to terminate.
-                continue
+                self.connection_lost_event.set()
+                return None
 
             if not self._maybe_drop():
                 self.sock.sendto(payload, addr)
