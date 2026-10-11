@@ -85,6 +85,12 @@ class App:
 
         while self.running:
             pkt = self.rudp.poll()
+            if self.rudp.connection_lost_event.is_set():
+                print("[ERROR] Connection lost - max retries exceeded; battle terminated.")
+                self.running = False
+                if self.battle:
+                    self.battle.state = State.GAME_OVER
+                break
             if pkt:
                 addr, msg = pkt
                 self.on_msg(addr, msg)
@@ -100,6 +106,8 @@ class App:
             try:
                 s = input().strip()
             except EOFError:
+                return
+            if not self.running or self.rudp.connection_lost_event.is_set():
                 return
             if not s:
                 continue
