@@ -13,6 +13,11 @@ from util import b64_encode_file, b64_save
 
 Addr = Tuple[str, int]
 
+SPECTATOR_MESSAGES = frozenset({
+    MsgType.ATTACK_ANNOUNCE, MsgType.DEFENSE_ANNOUNCE,
+    MsgType.CALCULATION_REPORT, MsgType.GAME_OVER,
+})
+
 def args():
     p = argparse.ArgumentParser()
     p.add_argument("--bind-ip", default="0.0.0.0")
@@ -64,6 +69,23 @@ class App:
         if mt != MsgType.ACK:
             fields["sequence_number"] = str(self.seq())
         self.rudp.send(addr, WireMessage(mt, fields))
+        if self.role == "host" and addr == self.peer and mt in SPECTATOR_MESSAGES:
+            self.broadcast_to_spectators(WireMessage(mt, fields))
+
+    def broadcast_to_spectators(self, msg: WireMessage):
+        """Best-effort copies; spectator loss must not terminate the battle."""
+        if self.role != "host" or msg.message_type not in SPECTATOR_MESSAGES:
+            return
+        fields = dict(msg.fields)
+        # Peer sequence numbers may collide with ours. Use the host's sequence
+        # space so the spectator's ReliableUDP duplicate filter accepts each copy.
+        fields["sequence_number"] = str(self.seq())
+        payload = WireMessage(msg.message_type, fields).to_bytes()
+        for spectator in self.spectators.copy():
+            try:
+                self.rudp.sock.sendto(payload, spectator)
+            except OSError as exc:
+                print(f"[WARN] Spectator relay to {spectator} failed: {exc}")
 
     def start(self):
         # Input thread (chat + moves)
@@ -185,10 +207,6 @@ class App:
             print("[OK] Battle ready. Host goes first. State=WAITING_FOR_MOVE")
 
     def on_msg(self, addr: Addr, msg: WireMessage):
-        # Host learns peer automatically
-        if self.role == "host" and self.peer is None:
-            self.peer = addr
-
         # Spectator joins host
         if msg.message_type == MsgType.SPECTATOR_REQUEST and self.role == "host":
             self.spectators.add(addr)
@@ -198,6 +216,18 @@ class App:
                 self.seed = secrets.randbelow(1_000_000_000)
             self.send(addr, MsgType.HANDSHAKE_RESPONSE, {"seed": str(self.seed)})
             return
+
+        # Registered spectators may chat, but cannot alter the battle or setup.
+        if self.role == "host" and addr in self.spectators and msg.message_type != MsgType.CHAT_MESSAGE:
+            return
+
+        # Only a player handshake can claim the opponent slot.
+        if self.role == "host" and self.peer is None and msg.message_type == MsgType.HANDSHAKE_REQUEST:
+            self.peer = addr
+
+        # poll() has already ACKed and deduplicated incoming peer packets.
+        if self.role == "host" and addr == self.peer and msg.message_type in SPECTATOR_MESSAGES:
+            self.broadcast_to_spectators(msg)
 
         # Join handshake
         if msg.message_type == MsgType.HANDSHAKE_REQUEST and self.role == "host":
@@ -219,6 +249,9 @@ class App:
         if msg.message_type == MsgType.HANDSHAKE_RESPONSE:
             self.seed = get_int(msg.fields, "seed", 0)
             print(f"[OK] HANDSHAKE_RESPONSE seed={self.seed}")
+
+            if self.role == "spectator":
+                return
 
             # Send BATTLE_SETUP (RFC)
             assert self.peer
@@ -444,3 +477,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
